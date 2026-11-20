@@ -1,0 +1,3 @@
+Vendor: Demo Worker Crash
+SIMULATE_CRASH
+Total: 10.00

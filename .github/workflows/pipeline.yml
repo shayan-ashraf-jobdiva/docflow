@@ -1,0 +1,143 @@
+name: CI/CD
+
+# Code change -> push -> test + security scan -> build zip -> S3 -> deploy to EC2.
+# Pull requests only run the checks. A push to main also builds and deploys.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # lets the job ask AWS for short-lived credentials (OIDC)
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run unit tests (the pipeline stops here if any test fails)
+        run: python -m pytest -v
+
+  security:
+    name: Security scan (DevSecOps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install bandit pip-audit
+      - name: SAST - Bandit static code analysis
+        run: bandit -r app -ll
+      - name: Dependency vulnerability scan - pip-audit
+        run: pip-audit -r requirements.txt
+      - name: Secret scan - Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build and upload to S3
+    needs: [test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package the application
+        id: pkg
+        run: |
+          VERSION="$(cat VERSION)"
+          FILE="build-v${VERSION}-${GITHUB_RUN_NUMBER}.zip"
+          zip -r "$FILE" app static samples requirements.txt VERSION -x '*/__pycache__/*'
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "### Build: \`$FILE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the build as a GitHub artifact too
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.file }}
+          path: ${{ steps.pkg.outputs.file }}
+
+      - name: Get AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload the build to S3
+        run: |
+          FILE="${{ steps.pkg.outputs.file }}"
+          aws s3 cp "$FILE" "s3://$S3_BUCKET/builds/$FILE"
+          aws s3 cp "$FILE" "s3://$S3_BUCKET/builds/latest.zip"
+          echo "Uploaded to s3://$S3_BUCKET/builds/$FILE (and builds/latest.zip)"
+          echo "Uploaded to \`s3://$S3_BUCKET/builds/$FILE\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy latest build from S3 to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run deploy.sh on the instance through SSM
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          # Put the variables in front of deploy.sh, then turn the script into
+          # the JSON list of lines that SSM expects.
+          {
+            echo "export BUCKET='$S3_BUCKET'"
+            echo "export AWS_REGION='$AWS_REGION'"
+            cat deploy/deploy.sh
+          } > remote.sh
+          jq -n --rawfile s remote.sh '{commands: ($s | split("\n"))}' > params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${GITHUB_SHA}" \
+            --parameters file://params.json \
+            --query "Command.CommandId" --output text)
+          echo "SSM command: $COMMAND_ID"
+
+          # 'wait' gives up after about 100 seconds or on failure, so keep going
+          # and read the real result below.
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || true
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query Status --output text)
+            case "$STATUS" in InProgress|Pending|Delayed) sleep 10 ;; *) break ;; esac
+          done
+          echo "----- output from the instance -----"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text
+          echo "Status: $STATUS"
+          [ "$STATUS" = "Success" ]
+
+      - name: Verify production
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused "http://$EC2_HOST/health"
+          echo
+          echo "Live at http://$EC2_HOST/ - version $(cat VERSION)"
+          echo "### Live at http://$EC2_HOST/ (version $(cat VERSION))" >> "$GITHUB_STEP_SUMMARY"

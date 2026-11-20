@@ -1,0 +1,7 @@
+Vendor: Karachi Office Supplies
+Invoice No: INV-2026-0142
+Date: 2026-10-15
+Paper A4 ream 10 x 4.50
+Stapler 2 x 12.00
+Toner cartridge 1 x 65.00
+Total: 134.00
