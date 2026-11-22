@@ -5,7 +5,7 @@
       "Sid": "DownloadBuildsFromS3",
       "Effect": "Allow",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::<BUCKET_NAME>/builds/*"
+      "Resource": "arn:aws:s3:::docflow-builds-shayan-2026/builds/*"
     }
   ]
 }

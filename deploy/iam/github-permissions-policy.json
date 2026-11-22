@@ -5,15 +5,15 @@
       "Sid": "UploadBuildsToS3",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::<BUCKET_NAME>/builds/*"
+      "Resource": "arn:aws:s3:::docflow-builds-shayan-2026/builds/*"
     },
     {
       "Sid": "RunCommandOnTheDocflowInstanceOnly",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
       "Resource": [
-        "arn:aws:ssm:<REGION>::document/AWS-RunShellScript",
-        "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/<INSTANCE_ID>"
+        "arn:aws:ssm:ap-southeast-2::document/AWS-RunShellScript",
+        "arn:aws:ec2:ap-southeast-2:276023598059:instance/i-0952e7ed39a459cc8"
       ]
     },
     {
